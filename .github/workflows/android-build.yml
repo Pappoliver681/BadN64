@@ -1,0 +1,115 @@
+name: Build badN64 Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['main']
+    paths:
+      - 'BadN64-source.zip'
+      - 'app/**'
+      - 'tools/**'
+      - 'tests/**'
+      - '*.gradle'
+      - 'gradle.properties'
+      - '.github/workflows/android-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: badn64-native-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BN_PROJECT: badn64-native-build/BadN64
+      BADN64_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare BadN64 source
+        run: |
+          python3 - <<'PY'
+          import pathlib, shutil, zipfile
+          destination = pathlib.Path('badn64-native-build').resolve()
+          destination.mkdir(exist_ok=True)
+          project = destination / 'BadN64'
+          if pathlib.Path('app/src/main/cpp/native_backend.cpp').is_file():
+              project.mkdir(exist_ok=True)
+              for name in ('app', 'tools', 'tests', '.github', 'README.md',
+                           'build.gradle', 'settings.gradle', 'gradle.properties', '.gitignore'):
+                  source = pathlib.Path(name)
+                  if source.is_dir(): shutil.copytree(source, project / name)
+                  elif source.is_file(): shutil.copyfile(source, project / name)
+          else:
+              with zipfile.ZipFile('BadN64-source.zip') as archive:
+                  for item in archive.infolist():
+                      target = (destination / item.filename).resolve()
+                      parts = pathlib.PurePosixPath(item.filename).parts
+                      if not target.is_relative_to(destination) or not parts or parts[0] != 'BadN64':
+                          raise SystemExit('Unsafe or unexpected source path')
+                  archive.extractall(destination)
+          for path in ('tools/native-runtime-build.sh', 'tools/fetch-core.py',
+                       'app/src/main/cpp/native_backend.cpp', 'app/src/main/cpp/rtc_engine.cpp',
+                       'app/src/main/java/com/badn64/app/NativeBridge.java'):
+              if not (project / path).is_file():
+                  raise SystemExit('Missing source: ' + path)
+          (project / 'dist').mkdir(exist_ok=True)
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Retain BadN64 signing identity
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BN_PROJECT }}/signing/badn64-development.keystore
+          key: badn64-development-signing-v1-${{ github.repository_id }}
+      - name: Cache verified Android toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BN_PROJECT }}/toolchain
+          key: badn64-native-linux-api36-ndk28-v1
+      - name: Validate live corruption behavior
+        run: |
+          bash "$BN_PROJECT/tools/test-native.sh"
+          bash "$BN_PROJECT/tools/test-backend.sh"
+      - name: Validate the actual software N64 core
+        run: bash "$BN_PROJECT/tools/test-core.sh"
+      - name: Compile, sign and verify the Android APK
+        run: |
+          set -o pipefail
+          bash "$BN_PROJECT/tools/native-runtime-build.sh" 2>&1 | tee "$BN_PROJECT/dist/build.log"
+          sha256sum "$BN_PROJECT/dist/BadN64-Native-Android16.apk" > "$BN_PROJECT/dist/BadN64-Native-Android16.apk.sha256"
+      - name: Preserve complete corresponding source
+        run: python3 "$BN_PROJECT/tools/package-source.py" --output "$BN_PROJECT/dist/BadN64-complete-source.zip"
+      - name: Downloadable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BadN64-Android
+          path: |
+            ${{ env.BN_PROJECT }}/dist/BadN64-Native-Android16.apk
+            ${{ env.BN_PROJECT }}/dist/BadN64-Native-Android16.apk.sha256
+            ${{ env.BN_PROJECT }}/dist/apk-badging.txt
+            ${{ env.BN_PROJECT }}/dist/apk-native-verification.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Complete source
+        uses: actions/upload-artifact@v4
+        with:
+          name: BadN64-source
+          path: ${{ env.BN_PROJECT }}/dist/BadN64-complete-source.zip
+          if-no-files-found: error
+          retention-days: 30
+      - name: Build and validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BadN64-diagnostics
+          path: |
+            ${{ env.BN_PROJECT }}/dist/build.log
+            ${{ env.BN_PROJECT }}/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
